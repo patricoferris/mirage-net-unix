@@ -19,8 +19,8 @@
 
 include Mirage_net.S
 
-val connect : string -> t Lwt.t
+val connect : sw:Eio.Std.Switch.t -> string -> t
 (** [connect tap] connects to the given tap interface. *)
 
-val fd: t -> Lwt_unix.file_descr
+val fd : t -> Eio_linux.FD.t
 (** [fd t] is [t]'s underneath file descriptor. *)

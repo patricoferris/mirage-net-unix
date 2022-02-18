@@ -14,143 +14,161 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
-open Lwt.Infix
+open Eio.Std
 
 let src = Logs.Src.create "netif" ~doc:"Mirage unix network module"
+
 module Log = (val Logs.src_log src : Logs.LOG)
 
 type t = {
-  id: string;
-  dev: Lwt_unix.file_descr;
-  mutable active: bool;
-  mac: Macaddr.t;
+  id : string;
+  dev : Eio_linux.FD.t;
+  mutable active : bool;
+  mac : Macaddr.t;
   mtu : int;
   stats : Mirage_net.stats;
+  output_buffer : Cstruct.t;
+  output_region : Uring.Region.t;
 }
 
 let fd t = t.dev
 
-type error = [
-  | Mirage_net.Net.error
-  | `Partial of string * int * Cstruct.t
-  | `Exn of exn
-]
+type Error.t += (*Partial of string * int * Cstruct.t*) Disconnected
 
-let pp_error ppf = function
-  | #Mirage_net.Net.error as e -> Mirage_net.Net.pp_error ppf e
-  | `Partial (id, len', buffer) ->
-    Fmt.pf ppf "netif %s: partial write (%d, expected %d)"
-      id len' buffer.Cstruct.len
-  | `Exn e -> Fmt.exn ppf e
+let () =
+  Error.register_printer ~id:"mirage-net-unix" ~title:"mirage-net-unix"
+    ~pp:(function
+    (*
+    | Partial (id, len, buffer) ->
+        Some
+          (fun f () ->
+            Fmt.pf f "netif %s: partial write (%d, expected %d)" id len
+              buffer.Cstruct.len)*)
+    | Disconnected -> Some Fmt.(const string "disconnected")
+    | _ -> None)
 
 let err_permission_denied devname =
   Printf.sprintf
     "Permission denied while opening the %s device. Please re-run using sudo."
     devname
 
-let connect devname =
+let connect ~sw devname =
   try
     Random.self_init ();
     let fd, devname = Tuntap.opentap ~pi:false ~devname () in
-    let dev = Lwt_unix.of_unix_file_descr ~blocking:true fd in
+    let dev = Eio_linux.FD.of_unix ~sw ~seekable:false ~close_unix:false fd in
     let mac = Macaddr.make_local (fun _ -> Random.int 256) in
     Tuntap.set_up_and_running devname;
     let mtu = Tuntap.get_mtu devname in
-    Log.debug (fun m -> m "plugging into %s with mac %a and mtu %d"
-                  devname Macaddr.pp mac mtu);
+    Log.debug (fun m ->
+        m "plugging into %s with mac %a and mtu %d" devname Macaddr.pp mac mtu);
     let active = true in
     let stats = Mirage_net.Stats.create () in
-    let t = { id=devname; dev; active; mac; mtu; stats } in
+    let slots = 64 in
+    let output_buffer = Cstruct.create (mtu * slots) in
+    let t =
+      {
+        id = devname;
+        dev;
+        active;
+        mac;
+        mtu;
+        stats;
+        output_buffer;
+        output_region =
+          Uring.Region.init ~block_size:mtu output_buffer.buffer slots;
+      }
+    in
     Log.info (fun m -> m "connect %s with mac %a" devname Macaddr.pp mac);
-    Lwt.return t
+    t
   with
-  | Failure "tun[open]: Permission denied" [@warning "-52"] ->
-    Lwt.fail_with (err_permission_denied devname)
-  | exn -> Lwt.fail exn
+  | ((Failure "tun[open]: Permission denied") [@warning "-52"]) ->
+      failwith (err_permission_denied devname)
+  | exn -> raise exn
 
 let disconnect t =
   Log.info (fun m -> m "disconnect %s" t.id);
   t.active <- false;
-  Lwt_unix.close t.dev >>= fun () ->
-  Tuntap.closetap t.id;
-  Lwt.return_unit
+  Eio_linux.FD.close t.dev
 
 (* Input a frame, and block if nothing is available *)
 let rec read t buf =
   let process () =
-    Lwt.catch (fun () ->
-        Lwt_cstruct.read t.dev buf >|= function
-        | (-1) -> Error `Continue      (* EAGAIN or EWOULDBLOCK *)
-        | 0    -> Error `Disconnected  (* EOF *)
-        | len ->
-          Mirage_net.Stats.rx t.stats (Int64.of_int len);
-          let buf = Cstruct.sub buf 0 len in
-          Ok buf)
-      (function
-        | Unix.Unix_error(Unix.ENXIO, _, _) ->
-          Log.err (fun m -> m "[read] device %s is down, stopping" t.id);
-          Lwt.return (Error `Disconnected)
-        | Lwt.Canceled ->
-          Log.err (fun m -> m "[read] user program requested cancellation of listen on %s" t.id);
-          Lwt.return (Error `Canceled)
-        | exn ->
-          Log.err (fun m -> m "[read] error: %s, continuing" (Printexc.to_string exn));
-          Lwt.return (Error `Continue))
+    match Eio_linux.readv t.dev [ buf ] with
+    | -1 -> Error `Continue (* EAGAIN or EWOULDBLOCK *)
+    | 0 -> Error `Disconnected (* EOF *)
+    | len ->
+        Mirage_net.Stats.rx t.stats (Int64.of_int len);
+        let buf = Cstruct.sub buf 0 len in
+        Ok buf
+    | exception Unix.Unix_error (Unix.ENXIO, _, _) ->
+        Log.err (fun m -> m "[read] device %s is down, stopping" t.id);
+        Error `Disconnected
+    | exception _exn ->
+        (*Log.err (fun m ->
+            m "[read] error: %s, continuing" (Printexc.to_string exn));*)
+        Eio.Std.Fibre.yield ();
+        Error `Continue
   in
-  process () >>= function
+  match process () with
   | Error `Continue -> read t buf
-  | Error `Canceled -> Lwt.return (Error `Canceled)
-  | Error `Disconnected -> Lwt.return (Error `Disconnected)
-  | Ok buf -> Lwt.return (Ok buf)
+  | Error `Disconnected -> Error `Disconnected
+  | Ok buf -> Ok buf
 
 let safe_apply f x =
-  Lwt.catch
-    (fun () -> f x)
-    (function
-      | Out_of_memory -> Lwt.fail Out_of_memory
-      | exn ->
-        Log.err (fun m -> m "[listen] error while handling %s, continuing. bt: %s"
-                    (Printexc.to_string exn) (Printexc.get_backtrace ()));
-        Lwt.return_unit)
+  try f x with
+  | Out_of_memory -> raise Out_of_memory
+  | exn ->
+      Log.err (fun m ->
+          m "[listen] error while handling %s, continuing. bt: %s"
+            (Printexc.to_string exn)
+            (Printexc.get_backtrace ()))
 
 (* Loop and listen for packets permanently *)
 (* this function has to be tail recursive, since it is called at the
    top level, otherwise memory of received packets and all reachable
    data is never claimed.  take care when modifying, here be dragons! *)
-let rec listen t ~header_size fn =
-  match t.active with
-  | true ->
-    let buf = Cstruct.create (t.mtu + header_size) in
-    let process () =
-      read t buf >|= function
-      | Ok buf              -> Lwt.async (fun () -> safe_apply fn buf) ; Ok ()
-      | Error `Canceled     -> Error `Disconnected
-      | Error `Disconnected -> t.active <- false ; Error `Disconnected
-    in
-    process () >>= (function
-        | Ok () -> (listen[@tailcall]) t ~header_size fn
-        | Error e -> Lwt.return (Error e))
-  | false -> Lwt.return (Ok ())
+let listen t ~header_size fn =
+  Switch.run @@ fun sw ->
+  let rec loop () =
+    match t.active with
+    | true -> (
+        let buf = Cstruct.create (t.mtu + header_size) in
+        let process () =
+          match read t buf with
+          | Ok buf ->
+              Fibre.fork ~sw (fun () -> safe_apply fn buf);
+              Ok ()
+          | Error `Canceled -> Error.v ~__POS__ Disconnected
+          | Error `Disconnected ->
+              t.active <- false;
+              Error.v ~__POS__ Disconnected
+        in
+        match process () with
+        | Ok () -> (loop [@tailcall]) ()
+        | Error e -> Error e)
+    | false -> Ok ()
+  in
+  loop ()
+
+let w = Semaphore.Binary.make true
 
 (* Transmit a packet from a Cstruct.t *)
 let write t ~size fillf =
+  Semaphore.Binary.acquire w;
   (* This is the interface to the cruel Lwt world with exceptions, we've to guard *)
-  let buf = Cstruct.create size in
-  let len = fillf buf in
-  if len > size then
-    Lwt.return (Error `Invalid_length)
+  let region = Eio_linux.alloc () (*Uring.Region.alloc t.output_region*) in
+  let len = fillf (Uring.Region.to_cstruct region) in
+  if len > size then Error.v ~__POS__ Mirage_net.Net.Invalid_length
   else
-    Lwt.catch (fun () ->
-        Lwt_bytes.write t.dev buf.Cstruct.buffer 0 len >|= fun len' ->
-        Mirage_net.Stats.tx t.stats (Int64.of_int len);
-        if len' <> len then Error (`Partial (t.id, len', buf))
-        else Ok ())
-      (fun exn -> Lwt.return (Error (`Exn exn)))
+    Error.catch ~__POS__ @@ fun () ->
+    Eio_linux.writev t.dev [ Uring.Region.to_cstruct ~len region ];
+    Eio_linux.free region;
+    Semaphore.Binary.release w;
+    Mirage_net.Stats.tx t.stats (Int64.of_int len);
+    ()
 
 let mac t = t.mac
-
 let mtu t = t.mtu
-
 let get_stats_counters t = t.stats
-
 let reset_stats_counters t = Mirage_net.Stats.reset t.stats

@@ -1,5 +1,5 @@
 (executables
- (names test)
+ (names test throughput)
  (libraries alcotest mirage-net-unix))
 
 (alias

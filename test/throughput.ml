@@ -30,17 +30,32 @@ let unwrap_result = function
   | Ok v -> v
   | Error trace -> Fmt.pr "%a" Error.pp_trace trace
 
+let sz = 1_000_000_000
+let n = 1
+
 let test_write ~sw () =
   let t = Netif.connect ~sw "tap0" in
   let mtu = Netif.mtu t in
-  Netif.write t ~size:mtu (fun _data -> mtu) |> unwrap_result;
-  Netif.write t ~size:(mtu + 14) (fun _data -> mtu + 14) |> unwrap_result;
-  Netif.write t ~size:(mtu + 14) (fun _data -> mtu + 22) |> unwrap_result
+  let t0 = Unix.gettimeofday () in
 
-let suite =
-  [
-   (* ("connect", `Quick, fun () -> run test_open_close);*)
-    ("write", `Quick, fun () -> run test_write);
-  ]
+  Eio.Std.Fibre.all
+    (List.init n (fun _ () ->
+         for _ = 0 to sz / n / mtu do
+           Netif.write t ~size:mtu (fun data ->
+            for i = 0 to ((mtu - 1) / 8) do 
+            Cstruct.LE.set_uint64 data (2*i) (Int64.of_int i)
+            done;
+            mtu) |> unwrap_result
+         done));
 
-let _ = Alcotest.run "mirage-net-unix" [ ("tests", suite) ]
+  Printf.printf "Wrote 1G in %.2fs" (Unix.gettimeofday () -. t0)
+
+let _ = run test_write
+
+
+(* 
+
+single cstruct copied into uring : parallelism of 32 = Wrote 1G in 0.56s
+
+
+*)
