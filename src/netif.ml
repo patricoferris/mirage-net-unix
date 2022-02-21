@@ -151,20 +151,16 @@ let listen t ~header_size fn =
   in
   loop ()
 
-let w = Semaphore.Binary.make true
-
 (* Transmit a packet from a Cstruct.t *)
 let write t ~size fillf =
-  Semaphore.Binary.acquire w;
-  (* This is the interface to the cruel Lwt world with exceptions, we've to guard *)
-  let region = Eio_linux.Low_level.alloc () (*Uring.Region.alloc t.output_region*) in
-  let len = fillf (Uring.Region.to_cstruct region) in
-  if len > size then Error.v ~__POS__ Mirage_net.Net.Invalid_length
+  let region = Eio_linux.Low_level.alloc () in
+  let region_cstruct = Cstruct.sub (Uring.Region.to_cstruct region) 0 size in
+  let len = fillf region_cstruct in
+  if len > size then Error.v ~__POS__ (Mirage_net.Net.Invalid_length len)
   else
     Error.catch ~__POS__ @@ fun () ->
     Eio_linux.Low_level.writev t.dev [ Uring.Region.to_cstruct ~len region ];
     Eio_linux.Low_level.free region;
-    Semaphore.Binary.release w;
     Mirage_net.Stats.tx t.stats (Int64.of_int len);
     ()
 
