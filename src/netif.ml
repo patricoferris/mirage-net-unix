@@ -92,26 +92,26 @@ let disconnect t =
   Eio_linux.FD.close t.dev
 
 (* Input a frame, and block if nothing is available *)
-let rec read t buf =
+let rec read ~upto t buf =
   let process () =
-    match Eio_linux.Low_level.readv t.dev [ buf ] with
+    match Eio_linux.Low_level.read_upto t.dev buf upto with
     | -1 -> Error `Continue (* EAGAIN or EWOULDBLOCK *)
     | 0 -> Error `Disconnected (* EOF *)
     | len ->
         Mirage_net.Stats.rx t.stats (Int64.of_int len);
-        let buf = Cstruct.sub buf 0 len in
+        let buf = Uring.Region.to_cstruct ~len buf in
         Ok buf
     | exception Unix.Unix_error (Unix.ENXIO, _, _) ->
         Log.err (fun m -> m "[read] device %s is down, stopping" t.id);
         Error `Disconnected
-    | exception _exn ->
-        (*Log.err (fun m ->
-            m "[read] error: %s, continuing" (Printexc.to_string exn));*)
+    | exception exn ->
+        Log.err (fun m ->
+            m "[read] error: %s, continuing" (Printexc.to_string exn));
         Eio.Std.Fibre.yield ();
         Error `Continue
   in
   match process () with
-  | Error `Continue -> read t buf
+  | Error `Continue -> read ~upto t buf
   | Error `Disconnected -> Error `Disconnected
   | Ok buf -> Ok buf
 
@@ -124,45 +124,49 @@ let safe_apply f x =
             (Printexc.to_string exn)
             (Printexc.get_backtrace ()))
 
+
+
 (* Loop and listen for packets permanently *)
 (* this function has to be tail recursive, since it is called at the
    top level, otherwise memory of received packets and all reachable
    data is never claimed.  take care when modifying, here be dragons! *)
 let listen t ~header_size fn =
-  Switch.run @@ fun sw ->
-  let rec loop () =
-    match t.active with
-    | true -> (
-        let buf = Cstruct.create (t.mtu + header_size) in
-        let process () =
-          match read t buf with
-          | Ok buf ->
-              Fibre.fork ~sw (fun () -> safe_apply fn buf);
-              Ok ()
-          | Error `Canceled -> Error.v ~__POS__ Disconnected
-          | Error `Disconnected ->
-              t.active <- false;
-              Error.v ~__POS__ Disconnected
-        in
-        match process () with
-        | Ok () -> (loop [@tailcall]) ()
-        | Error e -> Error e)
-    | false -> Ok ()
+  let listeners = 
+    List.init 8 (fun _ () ->
+    Switch.run @@ fun sw ->
+    let rec loop () =
+      match t.active with
+      | true -> (
+          let region = Eio_linux.Low_level.alloc () in
+          let process () =
+            Eio.Private.Ctf.label "netif: read";
+            match read ~upto:(t.mtu + header_size) t region with
+            | Ok buf ->
+                Fibre.fork ~sw (fun () -> 
+                  Fibre.yield ();
+                  Eio.Private.Ctf.label "netif: callback";
+                  safe_apply fn buf;
+                  Eio_linux.Low_level.free region);
+                Ok ()
+            | Error `Canceled -> Error.v ~__POS__ Disconnected
+            | Error `Disconnected ->
+                t.active <- false;
+                Error.v ~__POS__ Disconnected
+          in
+          match process () with
+          | Ok () -> (loop [@tailcall]) ()
+          | Error e -> Error e)
+      | false -> Ok ()
+    in
+    loop ())
   in
-  loop ()
+  Fibre.any listeners
 
 (* Transmit a packet from a Cstruct.t *)
-let write t ~size fillf =
-  let region = Eio_linux.Low_level.alloc () in
-  let region_cstruct = Cstruct.sub (Uring.Region.to_cstruct region) 0 size in
-  let len = fillf region_cstruct in
-  if len > size then Error.v ~__POS__ (Mirage_net.Net.Invalid_length len)
-  else
-    Error.catch ~__POS__ @@ fun () ->
-    Eio_linux.Low_level.writev t.dev [ Uring.Region.to_cstruct ~len region ];
-    Eio_linux.Low_level.free region;
-    Mirage_net.Stats.tx t.stats (Int64.of_int len);
-    ()
+let writev t bufs =
+  Error.catch ~__POS__ @@ fun () ->
+  Eio_linux.Low_level.writev t.dev bufs;
+  Mirage_net.Stats.tx t.stats (Int64.of_int (Cstruct.lenv bufs))
 
 let mac t = t.mac
 let mtu t = t.mtu
