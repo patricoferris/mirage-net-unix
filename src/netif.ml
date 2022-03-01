@@ -94,7 +94,10 @@ let disconnect t =
 (* Input a frame, and block if nothing is available *)
 let rec read ~upto t buf =
   let process () =
-    match Eio_linux.Low_level.read_upto t.dev buf upto with
+    Eio.Private.Ctf.note_increase "net_read" 1;
+    let v = Eio_linux.Low_level.read_upto t.dev buf upto in
+    Eio.Private.Ctf.note_increase "net_read" (-1);
+    match v with
     | -1 -> Error `Continue (* EAGAIN or EWOULDBLOCK *)
     | 0 -> Error `Disconnected (* EOF *)
     | len ->
@@ -132,19 +135,16 @@ let safe_apply f x =
    data is never claimed.  take care when modifying, here be dragons! *)
 let listen t ~header_size fn =
   let listeners = 
-    List.init 8 (fun _ () ->
+    List.init 4 (fun _ () ->
     Switch.run @@ fun sw ->
     let rec loop () =
       match t.active with
       | true -> (
           let region = Eio_linux.Low_level.alloc () in
           let process () =
-            Eio.Private.Ctf.label "netif: read";
             match read ~upto:(t.mtu + header_size) t region with
             | Ok buf ->
-                Fibre.fork ~sw (fun () -> 
-                  Fibre.yield ();
-                  Eio.Private.Ctf.label "netif: callback";
+                Fibre.fork ~sw (fun () ->
                   safe_apply fn buf;
                   Eio_linux.Low_level.free region);
                 Ok ()
@@ -165,6 +165,7 @@ let listen t ~header_size fn =
 (* Transmit a packet from a Cstruct.t *)
 let writev t bufs =
   Error.catch ~__POS__ @@ fun () ->
+  Eio.Private.Ctf.label "netif: writev";
   Eio_linux.Low_level.writev t.dev bufs;
   Mirage_net.Stats.tx t.stats (Int64.of_int (Cstruct.lenv bufs))
 
