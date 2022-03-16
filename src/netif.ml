@@ -110,7 +110,6 @@ let rec read ~upto t buf =
     | exception exn ->
         Log.err (fun m ->
             m "[read] error: %s, continuing" (Printexc.to_string exn));
-        Eio.Std.Fibre.yield ();
         Error `Continue
   in
   match process () with
@@ -135,18 +134,18 @@ let safe_apply f x =
    data is never claimed.  take care when modifying, here be dragons! *)
 let listen t ~header_size fn =
   let listeners = 
-    List.init 4 (fun _ () ->
+    List.init 8 (fun _ () ->
     Switch.run @@ fun sw ->
     let rec loop () =
       match t.active with
       | true -> (
-          let region = Eio_linux.Low_level.alloc () in
+          let region = Eio_linux.Low_level.alloc_fixed_or_wait () in
           let process () =
             match read ~upto:(t.mtu + header_size) t region with
             | Ok buf ->
-                Fibre.fork ~sw (fun () ->
+                Fiber.fork ~sw (fun () ->
                   safe_apply fn buf;
-                  Eio_linux.Low_level.free region);
+                  Eio_linux.Low_level.free_fixed region);
                 Ok ()
             | Error `Canceled -> Error.v ~__POS__ Disconnected
             | Error `Disconnected ->
@@ -160,7 +159,7 @@ let listen t ~header_size fn =
     in
     loop ())
   in
-  Fibre.any listeners
+  Fiber.any listeners
 
 (* Transmit a packet from a Cstruct.t *)
 let writev t bufs =

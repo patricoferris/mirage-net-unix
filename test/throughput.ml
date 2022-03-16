@@ -16,46 +16,46 @@
 
 open Printf
 
-let run test =
-  Eio_linux.run @@ fun _ ->
-  Eio.Std.Switch.run @@ fun sw -> test ~sw ()
-
-let test_open_close ~sw () =
-  let t = Netif.connect ~sw "tap0" in
-  printf "tap0: connected\n%!";
-  Netif.disconnect t;
-  printf "tap0: disconnected\n%!"
 
 let unwrap_result = function
   | Ok v -> v
   | Error trace -> Fmt.pr "%a" Error.pp_trace trace
 
-let sz = 1_000_000_000
-let n = 1
+let sz = 250_000_000
+let n = 32
+
+let mtu = Some 64
 
 let test_write ~sw () =
   let t = Netif.connect ~sw "tap0" in
-  let mtu = Netif.mtu t in
+  let mtu = 
+    Option.value mtu ~default:(Netif.mtu t) 
+  in
   let t0 = Unix.gettimeofday () in
 
-  Eio.Std.Fibre.all
+  let data = Cstruct.create_unsafe mtu in
+  for i = 0 to ((mtu - 1) / 8) do 
+    Cstruct.LE.set_uint64 data (2*i) (Int64.of_int i)
+  done;
+
+  Eio.Std.Fiber.all
     (List.init n (fun _ () ->
          for _ = 0 to sz / n / mtu do
-           Netif.write t ~size:mtu (fun data ->
-            for i = 0 to ((mtu - 1) / 8) do 
-            Cstruct.LE.set_uint64 data (2*i) (Int64.of_int i)
-            done;
-            mtu) |> unwrap_result
+           Netif.writev t [data] |> unwrap_result
          done));
+  let t = Unix.gettimeofday () -. t0 in
+  Printf.printf "Wrote 250M in %.2fs\n" t;
+  Printf.printf "(%.0f pps)\n" (Float.of_int (sz / mtu) /. t)
 
-  Printf.printf "Wrote 1G in %.2fs" (Unix.gettimeofday () -. t0)
+let tracing = false
 
-let _ = run test_write
+let may_trace fn = 
+  if tracing then
+    Eio_unix.Ctf.with_tracing "trace.ctf" fn
+  else
+    fn ()
 
-
-(* 
-
-single cstruct copied into uring : parallelism of 32 = Wrote 1G in 0.56s
-
-
-*)
+let _ = 
+  may_trace @@ fun () ->
+  Eio_linux.run @@ fun _ ->
+  Eio.Std.Switch.run @@ fun sw -> test_write ~sw ()
