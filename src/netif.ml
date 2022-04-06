@@ -23,6 +23,7 @@ module Log = (val Logs.src_log src : Logs.LOG)
 type t = {
   id : string;
   dev : Eio_linux.FD.t;
+  dev_fixed : Eio_linux.FD.fixed;
   mutable active : bool;
   mac : Macaddr.t;
   mtu : int;
@@ -57,6 +58,7 @@ let connect ~sw devname =
     Random.self_init ();
     let fd, devname = Tuntap.opentap ~pi:false ~devname () in
     let dev = Eio_linux.FD.of_unix ~sw ~seekable:false ~close_unix:false fd in
+    let dev_fixed = Eio_linux.FD.register dev in
     let mac = Macaddr.make_local (fun _ -> Random.int 256) in
     Tuntap.set_up_and_running devname;
     let mtu = Tuntap.get_mtu devname in
@@ -70,6 +72,7 @@ let connect ~sw devname =
       {
         id = devname;
         dev;
+        dev_fixed;
         active;
         mac;
         mtu;
@@ -95,7 +98,7 @@ let disconnect t =
 let rec read ~upto t buf =
   let process () =
     Eio.Private.Ctf.note_increase "net_read" 1;
-    let v = Eio_linux.Low_level.read_upto t.dev buf upto in
+    let v = Eio_linux.Low_level.read_upto_fixed t.dev_fixed buf upto in
     Eio.Private.Ctf.note_increase "net_read" (-1);
     match v with
     | -1 -> Error `Continue (* EAGAIN or EWOULDBLOCK *)
@@ -165,7 +168,7 @@ let listen t ~header_size fn =
 let writev t bufs =
   Error.catch ~__POS__ @@ fun () ->
   Eio.Private.Ctf.label "netif: writev";
-  Eio_linux.Low_level.writev t.dev bufs;
+  Eio_linux.Low_level.writev_fixed t.dev_fixed bufs;
   Mirage_net.Stats.tx t.stats (Int64.of_int (Cstruct.lenv bufs))
 
 let mac t = t.mac
