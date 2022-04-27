@@ -33,9 +33,10 @@ let unwrap_result = function
 let test_write ~sw () =
   let t = Netif.connect ~sw "tap0" in
   let mtu = Netif.mtu t in
-  Netif.write t ~size:mtu (fun _data -> mtu) |> unwrap_result;
-  Netif.write t ~size:(mtu + 14) (fun _data -> mtu + 14) |> unwrap_result;
-  Netif.write t ~size:(mtu + 14) (fun _data -> mtu + 22) |> unwrap_result
+  let data = Cstruct.create (mtu+22) in
+  Netif.writev t [Cstruct.sub data 0 mtu] |> unwrap_result;
+  Netif.writev t [Cstruct.sub data 0 (mtu + 14)] |> unwrap_result;
+  Netif.writev t [Cstruct.sub data 0 (mtu + 22)] |> unwrap_result
 
 let suite =
   [
