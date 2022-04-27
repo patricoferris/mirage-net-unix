@@ -14,9 +14,6 @@
  * PERFORMANCE OF THIS SOFTWARE.
  *)
 
-open Printf
-
-
 let unwrap_result = function
   | Ok v -> v
   | Error trace -> Fmt.pr "%a" Error.pp_trace trace
