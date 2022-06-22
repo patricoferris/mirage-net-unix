@@ -33,19 +33,8 @@ type t = {
 
 let fd t = t.dev
 
-type Error.t += (*Partial of string * int * Cstruct.t*) Disconnected
+exception (*Partial of string * int * Cstruct.t*) Disconnected
 
-let () =
-  Error.register_printer ~id:"mirage-net-unix" ~title:"mirage-net-unix"
-    ~pp:(function
-    (*
-    | Partial (id, len, buffer) ->
-        Some
-          (fun f () ->
-            Fmt.pf f "netif %s: partial write (%d, expected %d)" id len
-              buffer.Cstruct.len)*)
-    | Disconnected -> Some Fmt.(const string "disconnected")
-    | _ -> None)
 
 let err_permission_denied devname =
   Printf.sprintf
@@ -144,18 +133,17 @@ let listen t ~header_size fn =
             match read ~upto:(t.mtu + header_size) t region with
             | Ok buf ->
                 Fiber.fork ~sw (fun () ->
+                  Log.info (fun f -> f "netif: read (%d)" (Cstruct.length buf));
                   safe_apply fn buf;
-                  Eio_linux.Low_level.free_fixed region);
-                Ok ()
-            | Error `Canceled -> Error.v ~__POS__ Disconnected
+                  Eio_linux.Low_level.free_fixed region)
+            | Error `Canceled -> raise Disconnected
             | Error `Disconnected ->
                 t.active <- false;
-                Error.v ~__POS__ Disconnected
+                raise Disconnected
           in
-          match process () with
-          | Ok () -> (loop [@tailcall]) ()
-          | Error e -> Error e)
-      | false -> Ok ()
+          process ();
+          (loop [@tailcall]) ())
+      | false -> ()
     in
     loop ())
   in
@@ -163,7 +151,7 @@ let listen t ~header_size fn =
 
 (* Transmit a packet from a Cstruct.t *)
 let writev t bufs =
-  Error.catch ~__POS__ @@ fun () ->
+  Log.info (fun f -> f "netif: writev (%d)" (Cstruct.lenv bufs));
   Eio.Private.Ctf.label "netif: writev";
   Eio_linux.Low_level.writev t.dev bufs;
   Mirage_net.Stats.tx t.stats (Int64.of_int (Cstruct.lenv bufs))

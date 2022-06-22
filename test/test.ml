@@ -26,17 +26,13 @@ let test_open_close ~sw () =
   Netif.disconnect t;
   printf "tap0: disconnected\n%!"
 
-let unwrap_result = function
-  | Ok v -> v
-  | Error trace -> Fmt.pr "%a" Error.pp_trace trace
-
 let test_write ~sw () =
   let t = Netif.connect ~sw "tap0" in
   let mtu = Netif.mtu t in
   let data = Cstruct.create (mtu+22) in
-  Netif.writev t [Cstruct.sub data 0 mtu] |> unwrap_result;
-  Netif.writev t [Cstruct.sub data 0 (mtu + 14)] |> unwrap_result;
-  Netif.writev t [Cstruct.sub data 0 (mtu + 22)] |> unwrap_result
+  Netif.writev t [Cstruct.sub data 0 mtu];
+  Netif.writev t [Cstruct.sub data 0 (mtu + 14)];
+  Netif.writev t [Cstruct.sub data 0 (mtu + 22)]
 
 let suite =
   [

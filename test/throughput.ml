@@ -14,10 +14,6 @@
  * PERFORMANCE OF THIS SOFTWARE.
  *)
 
-let unwrap_result = function
-  | Ok v -> v
-  | Error trace -> Fmt.pr "%a" Error.pp_trace trace
-
 let sz = 250_000_000
 let n = 32
 
@@ -38,7 +34,7 @@ let test_write ~sw () =
   Eio.Std.Fiber.all
     (List.init n (fun _ () ->
          for _ = 0 to sz / n / mtu do
-           Netif.writev t [data] |> unwrap_result
+           Netif.writev t [data]
          done));
   let t = Unix.gettimeofday () -. t0 in
   Printf.printf "Wrote 250M in %.2fs\n" t;
