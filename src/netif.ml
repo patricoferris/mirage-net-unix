@@ -22,13 +22,13 @@ module Log = (val Logs.src_log src : Logs.LOG)
 
 type t = {
   id : string;
-  dev : Eio_linux.FD.t;
+  dev : Eio_unix.socket;
   mutable active : bool;
   mac : Macaddr.t;
   mtu : int;
   stats : Mirage_net.stats;
   output_buffer : Cstruct.t;
-  output_region : Uring.Region.t;
+  output_region : Cstruct.t;
 }
 
 let fd t = t.dev
@@ -45,7 +45,7 @@ let connect ~sw devname =
   try
     Random.self_init ();
     let fd, devname = Tuntap.opentap ~pi:false ~devname () in
-    let dev = Eio_linux.FD.of_unix ~sw ~seekable:false ~close_unix:false fd in
+    let dev = Eio_unix.FD.as_socket ~sw ~close_unix:false fd in
     let mac = Macaddr.make_local (fun _ -> Random.int 256) in
     Tuntap.set_up_and_running devname;
     let mtu = Tuntap.get_mtu devname in
@@ -64,8 +64,7 @@ let connect ~sw devname =
         mtu;
         stats;
         output_buffer;
-        output_region =
-          Uring.Region.init ~block_size:mtu output_buffer.buffer slots;
+        output_region = Cstruct.create mtu;
       }
     in
     Log.info (fun m -> m "connect %s with mac %a" devname Macaddr.pp mac);
@@ -78,20 +77,20 @@ let connect ~sw devname =
 let disconnect t =
   Log.info (fun m -> m "disconnect %s" t.id);
   t.active <- false;
-  Eio_linux.FD.close t.dev
+  Eio.Flow.close t.dev
 
 (* Input a frame, and block if nothing is available *)
 let rec read ~upto t buf =
   let process () =
     Eio.Private.Ctf.note_increase "net_read" 1;
-    let v = Eio_linux.Low_level.read_upto t.dev buf upto in
+    let v = Eio.Flow.read t.dev (Cstruct.sub buf 0 upto) in
     Eio.Private.Ctf.note_increase "net_read" (-1);
     match v with
     | -1 -> Error `Continue (* EAGAIN or EWOULDBLOCK *)
     | 0 -> Error `Disconnected (* EOF *)
     | len ->
         Mirage_net.Stats.rx t.stats (Int64.of_int len);
-        let buf = Uring.Region.to_cstruct ~len buf in
+        let buf = Cstruct.sub buf 0 len in
         Ok buf
     | exception Unix.Unix_error (Unix.ENXIO, _, _) ->
         Log.err (fun m -> m "[read] device %s is down, stopping" t.id);
@@ -122,20 +121,20 @@ let safe_apply f x =
    top level, otherwise memory of received packets and all reachable
    data is never claimed.  take care when modifying, here be dragons! *)
 let listen t ~header_size fn =
-  let listeners = 
+  let listeners =
     List.init 8 (fun _ () ->
     Switch.run @@ fun sw ->
     let rec loop () =
       match t.active with
       | true -> (
-          let region = Eio_linux.Low_level.alloc_fixed_or_wait () in
+          let region = Cstruct.create 4096 in
           let process () =
             match read ~upto:(t.mtu + header_size) t region with
             | Ok buf ->
                 Fiber.fork ~sw (fun () ->
                   Log.info (fun f -> f "netif: read (%d)" (Cstruct.length buf));
-                  safe_apply fn buf;
-                  Eio_linux.Low_level.free_fixed region)
+                  safe_apply fn buf)
+                  (* Eio_linux.Low_level.free_fixed region) *)
             | Error `Canceled -> raise Disconnected
             | Error `Disconnected ->
                 t.active <- false;
@@ -153,7 +152,7 @@ let listen t ~header_size fn =
 let writev t bufs =
   Log.info (fun f -> f "netif: writev (%d)" (Cstruct.lenv bufs));
   Eio.Private.Ctf.label "netif: writev";
-  Eio_linux.Low_level.writev t.dev bufs;
+  Eio.Flow.copy (Eio.Flow.cstruct_source bufs) t.dev;
   Mirage_net.Stats.tx t.stats (Int64.of_int (Cstruct.lenv bufs))
 
 let mac t = t.mac
